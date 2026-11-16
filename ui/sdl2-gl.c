@@ -230,6 +230,61 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
                          backing_id, false);
 }
 
+/* Test-only GPU queries inspect the completed back buffer. Only aggregate
+ * sample counts cross to the CPU; no image/texture pixel data is downloaded. */
+static void lm_scanout_check(int width, int height, unsigned frame, GLuint source)
+{
+    if (g_strcmp0(getenv("LM_WIN32_SCANOUT_CHECK"), "1") != 0 ||
+        (frame != 61 && frame != 97 && frame != 149 && frame != 180)) { return; }
+    GLuint textures[2], framebuffer, vao, query, shaders[2], program;
+    const char *vertex = "#version 330 core\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.0-1.0,0,1);}";
+    const char *fragment = "#version 330 core\nuniform sampler2D image;uniform int metric;uniform int height;out vec4 color;void main(){ivec2 p=ivec2(gl_FragCoord.xy);ivec3 c=ivec3(round(texelFetch(image,p,0).rgb*255.0));bool bar=all(equal(c,ivec3(22,29,46)));bool pink=all(equal(c,ivec3(255,159,203)));bool ok=metric==6?true:metric==0?any(greaterThan(c,ivec3(0))):metric==1?bar&&p.y>=height-40:metric==2?bar&&p.y<40:metric==3?pink:metric==4?all(equal(c,ivec3(255,74,100))):pink&&((p.x+3*p.y)%127<63);if(!ok)discard;color=vec4(1);}";
+    glGenTextures(2, textures);
+    for (unsigned i=0;i<2;i++) {
+        glBindTexture(GL_TEXTURE_2D, textures[i]);
+        glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8,width,height);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    }
+    glGenFramebuffers(1,&framebuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,source ? framebuffer : 0);
+    if(source) glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,source,0);
+    glReadBuffer(source ? GL_COLOR_ATTACHMENT0 : GL_BACK);
+    glBindTexture(GL_TEXTURE_2D,textures[0]);
+    glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,0,0,width,height);
+    glBindFramebuffer(GL_FRAMEBUFFER,framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,textures[1],0);
+    if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){fprintf(stderr,"LM_WIN32_CHECK_FAILED framebuffer\n");exit(1);}
+    shaders[0]=glCreateShader(GL_VERTEX_SHADER);shaders[1]=glCreateShader(GL_FRAGMENT_SHADER);
+    for(unsigned i=0;i<2;i++){
+        const char *shader_source=i?fragment:vertex;GLint ok=0;
+        glShaderSource(shaders[i],1,&shader_source,NULL);glCompileShader(shaders[i]);
+        glGetShaderiv(shaders[i],GL_COMPILE_STATUS,&ok);
+        if(!ok){char log[2048];glGetShaderInfoLog(shaders[i],sizeof(log),NULL,log);fprintf(stderr,"LM_WIN32_CHECK_FAILED shader %s\n",log);exit(1);}
+    }
+    program=glCreateProgram();glAttachShader(program,shaders[0]);glAttachShader(program,shaders[1]);glLinkProgram(program);
+    GLint linked=0;glGetProgramiv(program,GL_LINK_STATUS,&linked);
+    if(!linked){fprintf(stderr,"LM_WIN32_CHECK_FAILED link\n");exit(1);}
+    glUseProgram(program);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,textures[0]);
+    glUniform1i(glGetUniformLocation(program,"image"),0);glUniform1i(glGetUniformLocation(program,"height"),height);
+    glGenVertexArrays(1,&vao);glBindVertexArray(vao);glGenQueries(1,&query);
+    glViewport(0,0,width,height);
+    glDisable(GL_DEPTH_TEST);glDisable(GL_STENCIL_TEST);glDisable(GL_SCISSOR_TEST);glDisable(GL_BLEND);glDisable(GL_CULL_FACE);glDisable(GL_RASTERIZER_DISCARD);
+    GLuint counts[7]={0};
+    for(int metric=0;metric<7;metric++){
+        glUniform1i(glGetUniformLocation(program,"metric"),metric);
+        glBeginQuery(GL_SAMPLES_PASSED,query);glDrawArrays(GL_TRIANGLES,0,3);glEndQuery(GL_SAMPLES_PASSED);
+        glFlush();GLint ready=0;int64_t deadline=g_get_monotonic_time()+2000000;
+        while(!ready&&g_get_monotonic_time()<deadline){glGetQueryObjectiv(query,GL_QUERY_RESULT_AVAILABLE,&ready);if(!ready)g_usleep(1000);}
+        if(!ready){fprintf(stderr,"LM_WIN32_CHECK_FAILED query timeout\n");exit(1);}
+        glGetQueryObjectuiv(query,GL_QUERY_RESULT,&counts[metric]);
+    }
+    GLenum error=glGetError();
+    fprintf(stderr,"LM_WIN32_GPU_FRAME_CHECK source=%u frame=%u size=%dx%d nonblack=%u topbar=%u bottombar=%u pink=%u red=%u signature=%u control=%u gl_error=%x renderer=%s no_pixel_download\n",source,frame,width,height,counts[0],counts[1],counts[2],counts[3],counts[4],counts[5],counts[6],error,glGetString(GL_RENDERER));
+    glUseProgram(0);glBindVertexArray(0);glBindTexture(GL_TEXTURE_2D,0);glBindFramebuffer(GL_FRAMEBUFFER,0);
+    glDeleteQueries(1,&query);glDeleteVertexArrays(1,&vao);glDeleteProgram(program);glDeleteShader(shaders[0]);glDeleteShader(shaders[1]);glDeleteFramebuffers(1,&framebuffer);glDeleteTextures(2,textures);
+    if(error!=GL_NO_ERROR){fprintf(stderr,"LM_WIN32_CHECK_FAILED gl error\n");exit(1);}
+}
 void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
                            uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
@@ -249,8 +304,22 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
 
     SDL_GetWindowSize(scon->real_window, &ww, &wh);
     egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
-    egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
+    if (g_strcmp0(getenv("LM_WIN32_GPU_SCANOUT"), "1") == 0) {
+    glActiveTexture(GL_TEXTURE0);
+    glBindSampler(0,0);
+    glBindTexture(GL_TEXTURE_2D,scon->guest_fb.texture);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    egl_texture_blit(scon->gls, &scon->win_fb, &scon->guest_fb, !scon->y0_top);
+    } else {
+        egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
+    }
 
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    static unsigned checked_frame = 0;
+    ++checked_frame;
+    lm_scanout_check(ww, wh, checked_frame, scon->guest_fb.texture);
+    lm_scanout_check(ww, wh, checked_frame, 0);
     SDL_GL_SwapWindow(scon->real_window);
 
     /* Keep poll rate high while frames are being presented */

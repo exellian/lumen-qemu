@@ -93,7 +93,7 @@ void sdl2_window_create(struct sdl2_console *scon)
     } else {
         flags |= SDL_WINDOW_RESIZABLE;
     }
-    if (scon->hidden) {
+    if (scon->hidden || g_strcmp0(getenv("LM_WIN32_HEADLESS_TEST"), "1") == 0) {
         flags |= SDL_WINDOW_HIDDEN;
     }
 #ifdef CONFIG_OPENGL

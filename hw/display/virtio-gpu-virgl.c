@@ -23,6 +23,9 @@
 #include "ui/egl-helpers.h"
 
 #include <virglrenderer.h>
+#ifdef CONFIG_WIN32
+#include "hw/virtio/lm-win32-scanout.h"
+#endif
 
 /*
  * Windows-host video-accel support: virglrenderer's VA-API (virgl_video)
@@ -60,6 +63,11 @@ struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
     void *map_fixed;
+#ifdef CONFIG_WIN32
+    LmWin32Scanout *lm_scanout;
+    uint32_t lm_width;
+    uint32_t lm_height;
+#endif
 };
 
 static struct virtio_gpu_virgl_resource *
@@ -444,6 +452,10 @@ virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
     }
     virgl_renderer_resource_unref(res->base.resource_id);
 
+#ifdef CONFIG_WIN32
+    lm_win32_scanout_free(res->lm_scanout);
+#endif
+
     QTAILQ_REMOVE(&g->reslist, &res->base, next);
 
     g_free(res);
@@ -551,7 +563,29 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
         if (g->parent_obj.scanout[i].resource_id != rf.resource_id) {
             continue;
         }
+#ifdef CONFIG_WIN32
+        struct virtio_gpu_virgl_resource *res =
+            virtio_gpu_virgl_find_resource(g, rf.resource_id);
+        if (res && res->lm_scanout) {
+            /* Make the consumer's GL context current before its external-memory
+             * acquire. A wait in virgl's context does not update SDL's texture cache. */
+            dpy_gl_scanout_texture(g->parent_obj.scanout[i].con,
+                                  lm_win32_scanout_texture(res->lm_scanout), true,
+                                  res->lm_width, res->lm_height,
+                                  0, 0, res->lm_width, res->lm_height, NULL);
+        }
+        if (res && res->lm_scanout && !lm_win32_scanout_begin(res->lm_scanout)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            return;
+        }
+#endif
         virtio_gpu_rect_update(g, i, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+#ifdef CONFIG_WIN32
+        if (res && res->lm_scanout && !lm_win32_scanout_end(res->lm_scanout)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            return;
+        }
+#endif
     }
 }
 
@@ -1013,6 +1047,44 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
         return;
     }
+#ifdef CONFIG_WIN32
+    if (g_strcmp0(getenv("LM_WIN32_GPU_SCANOUT"), "1") == 0) {
+        if (ss.format != VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM ||
+            ss.r.x || ss.r.y || ss.r.width != ss.width || ss.r.height != ss.height ||
+            ss.width > 4096 || ss.height > 2160 || ss.offsets[0] ||
+            (uint64_t)ss.width * ss.height * 4 > res->base.blob_size ||
+            !epoxy_has_gl_extension("GL_EXT_memory_object_win32")) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+        if (res->lm_scanout &&
+            (res->lm_width != ss.width || res->lm_height != ss.height)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+        virgl_renderer_force_ctx_0();
+        if (!res->lm_scanout) {
+            res->lm_scanout = lm_win32_scanout_new(ss.resource_id, res->base.blob_size,
+                                                 ss.width, ss.height);
+            if (!res->lm_scanout) {
+                cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+                return;
+            }
+            res->lm_width = ss.width;
+            res->lm_height = ss.height;
+            fprintf(stderr, "LM_WIN32_GPU_IMAGE_IMPORTED %ux%u no_pixel_readback\n",
+                    ss.width, ss.height);
+        }
+        g->parent_obj.enable = 1;
+        g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+        qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
+                            ss.width, ss.height);
+        dpy_gl_scanout_texture(g->parent_obj.scanout[ss.scanout_id].con,
+                              lm_win32_scanout_texture(res->lm_scanout), true, ss.width, ss.height,
+                              0, 0, ss.width, ss.height, NULL);
+        return;
+    }
+#endif
     if (res->base.dmabuf_fd < 0) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource not backed by dmabuf %d\n",
                       __func__, ss.resource_id);
